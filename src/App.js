@@ -39,7 +39,10 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'facade-constructor-pro';
-const apiKey = process.env.REACT_APP_GEMINI_KEY || ""; 
+
+// ИСПРАВЛЕНИЕ: Безопасный доступ к API ключу.
+// В среде Canvas/Preview API ключ передается через переменную apiKey, которая уже определена или должна быть пустой строкой.
+const apiKey = ""; 
 
 const FACADE_TYPES = [
   { id: 'solid', name: 'Глухой' },
@@ -139,18 +142,12 @@ const App = () => {
   const calculation = useMemo(() => {
     if (items.length === 0) return { area: 0, roundedArea: 0, complexityExtra: 0, total: 0 };
     
-    // Считаем точную фактическую площадь в м2
     const realArea = items.reduce((acc, item) => {
         const h = Math.max(0, Number(item.height));
         const w = Math.max(0, Number(item.width));
         const c = Math.max(0, Number(item.count));
         return acc + (h * w * c) / 1000000;
     }, 0);
-    
-    // ЛОГИКА ОКРУГЛЕНИЯ:
-    // 1. Если < 1 -> 1
-    // 2. Если дробная часть < 0.5 -> целое в меньшую сторону (floor)
-    // 3. Если дробная часть >= 0.5 -> целое в большую сторону (ceil)
     
     let roundedAreaForPrice = 1;
     if (realArea > 0) {
@@ -160,8 +157,6 @@ const App = () => {
         const integerPart = Math.floor(realArea);
         const decimalPart = realArea - integerPart;
         
-        // Пример: 7.08 -> 0.08 < 0.5 -> 7
-        // Пример: 7.5 -> 0.5 >= 0.5 -> 8
         if (decimalPart < 0.5) {
           roundedAreaForPrice = integerPart;
         } else {
@@ -190,18 +185,6 @@ const App = () => {
     };
   }, [items, config]);
 
-  const handleFileUploadForItem = async (id, e) => {
-    const file = e.target.files?.[0];
-    if (!file || !user) return;
-    const reader = new FileReader();
-    reader.onloadend = async () => {
-      await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', id), {
-        file: { data: reader.result, name: file.name }
-      });
-    };
-    reader.readAsDataURL(file);
-  };
-
   const convertCmToMm = async () => {
     if (!user || items.length === 0 || isConverted) return;
     const batch = writeBatch(db);
@@ -219,6 +202,7 @@ const App = () => {
   const handleScanImage = async (e) => {
     const file = e.target.files?.[0];
     if (!file || !user) return;
+    
     setIsScanning(true);
     setIsConverted(false);
     const reader = new FileReader();
@@ -226,21 +210,39 @@ const App = () => {
       const base64Data = reader.result.split(',')[1];
       try {
         const prompt = `Анализируй фото заказа. Извлеки JSON список деталей: [{"height": число, "width": число, "count": число, "note": "текст"}]. Все изделия должны иметь тип "solid". Соблюдай порядок деталей точно как в списке. Только JSON.`;
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+        
+        // Экспоненциальная задержка для API (Exponential backoff)
+        const fetchWithRetry = async (url, options, retries = 5, backoff = 1000) => {
+          try {
+            const res = await fetch(url, options);
+            if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+            return await res.json();
+          } catch (err) {
+            if (retries > 0) {
+              await new Promise(r => setTimeout(r, backoff));
+              return fetchWithRetry(url, options, retries - 1, backoff * 2);
+            }
+            throw err;
+          }
+        };
+
+        const result = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: file.type, data: base64Data } }] }] })
         });
-        const result = await response.json();
+
         const textResponse = result.candidates?.[0]?.content?.parts?.[0]?.text;
         if (textResponse) {
           const cleanJson = textResponse.replace(/```json|```/g, '').trim();
           const parsedItems = JSON.parse(cleanJson);
           const baseTime = Date.now();
-          for (let i = 0; i < parsedItems.length; i++) {
-            const item = parsedItems[i];
+          const batch = writeBatch(db);
+          
+          parsedItems.forEach((item, i) => {
             if (item.height > 0 && item.width > 0) {
-              await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'currentOrder'), {
+              const newDocRef = doc(collection(db, 'artifacts', appId, 'users', user.uid, 'currentOrder'));
+              batch.set(newDocRef, {
                 height: item.height, 
                 width: item.width, 
                 count: item.count > 0 ? item.count : 1, 
@@ -250,9 +252,15 @@ const App = () => {
                 file: null
               });
             }
-          }
+          });
+          await batch.commit();
         }
-      } catch (err) { console.error(err); } finally { setIsScanning(false); e.target.value = ''; }
+      } catch (err) { 
+        console.error("Scanning error:", err);
+      } finally { 
+        setIsScanning(false); 
+        e.target.value = ''; 
+      }
     };
     reader.readAsDataURL(file);
   };
@@ -276,15 +284,6 @@ const App = () => {
     });
     setFormData({ ...formData, height: '', width: '', count: '1', note: '' });
     heightRef.current?.focus();
-  };
-
-  const updateItem = async (id, field, value) => {
-    let finalValue = value;
-    if (['height', 'width', 'count'].includes(field)) {
-        const num = Number(String(value).replace(',', '.'));
-        finalValue = isNaN(num) ? value : num;
-    }
-    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', id), { [field]: finalValue });
   };
 
   const toggleSelect = (id) => {
@@ -436,22 +435,6 @@ const App = () => {
           </div>
         </section>
 
-        {/* ПАНЕЛЬ МАССОВЫХ ДЕЙСТВИЙ */}
-        {selectedIds.length > 0 && (
-          <div className="bg-black text-white p-4 rounded-2xl flex items-center justify-between animate-in slide-in-from-top-4 duration-300 shadow-xl">
-            <div className="flex items-center gap-3">
-              <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-              <span className="font-bold">Выбрано: {selectedIds.length} поз.</span>
-            </div>
-            <button 
-              onClick={deleteSelected}
-              className="flex items-center gap-2 bg-red-500/20 hover:bg-red-500 text-red-100 px-4 py-2 rounded-xl transition-all font-black uppercase text-[10px]"
-            >
-              <Trash2 className="w-4 h-4" /> Удалить выбранное
-            </button>
-          </div>
-        )}
-
         {/* ТАБЛИЦА */}
         <section className="bg-white rounded-[2rem] border shadow-sm overflow-hidden">
           <div className="overflow-x-auto">
@@ -482,46 +465,50 @@ const App = () => {
                           {selectedIds.includes(item.id) ? <CheckSquare className="w-5 h-5 text-black" /> : <Square className="w-5 h-5 text-zinc-300 group-hover:text-zinc-400" />}
                         </button>
                       </td>
-                      <td className="px-4 py-3 text-center">
-                         <input type="text" inputMode="decimal" className="w-16 text-center bg-transparent outline-none font-mono font-bold text-base focus:text-black border-b border-transparent focus:border-zinc-200" value={item.height} onChange={e => updateItem(item.id, 'height', cleanNumericInput(e.target.value))} />
+                      <td className="px-4 py-3 text-center font-mono font-bold">
+                        <input 
+                            type="text" 
+                            className="w-16 bg-transparent text-center outline-none focus:bg-white focus:ring-1 focus:ring-black rounded"
+                            value={item.height}
+                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { height: cleanNumericInput(e.target.value, false) })}
+                        />
+                      </td>
+                      <td className="px-4 py-3 text-center font-mono font-bold">
+                        <input 
+                            type="text" 
+                            className="w-16 bg-transparent text-center outline-none focus:bg-white focus:ring-1 focus:ring-black rounded"
+                            value={item.width}
+                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { width: cleanNumericInput(e.target.value, false) })}
+                        />
                       </td>
                       <td className="px-4 py-3 text-center">
-                         <input type="text" inputMode="decimal" className="w-16 text-center bg-transparent outline-none font-mono font-bold text-base focus:text-black border-b border-transparent focus:border-zinc-200" value={item.width} onChange={e => updateItem(item.id, 'width', cleanNumericInput(e.target.value))} />
-                      </td>
-                      <td className="px-4 py-3 text-center">
-                        <input type="text" inputMode="numeric" className="w-10 text-center bg-zinc-50 rounded-lg py-1 font-bold outline-none" value={item.count} onChange={e => updateItem(item.id, 'count', cleanNumericInput(e.target.value, false))} />
+                        <input 
+                            type="text" 
+                            className="w-10 bg-transparent text-center outline-none focus:bg-white focus:ring-1 focus:ring-black rounded"
+                            value={item.count}
+                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { count: cleanNumericInput(e.target.value, false) })}
+                        />
                       </td>
                       <td className="px-6 py-3">
-                        <select 
-                          className={`text-[10px] font-black uppercase px-2 py-1 rounded-md outline-none transition-colors ${[
-                            'integrated', 'grille', 'panno', 'multi_panels', 'yoke', 'plinth', 'column', 'custom'
-                          ].includes(item.type) ? 'bg-amber-100 text-amber-700' : 'bg-zinc-100'}`} 
-                          value={item.type} 
-                          onChange={e => updateItem(item.id, 'type', e.target.value)}
-                        >
-                          {FACADE_TYPES.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
-                        </select>
+                         <select 
+                            className="text-[10px] font-black uppercase px-2 py-1 bg-zinc-100 rounded-md outline-none"
+                            value={item.type}
+                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { type: e.target.value })}
+                         >
+                            {FACADE_TYPES.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                         </select>
                       </td>
-                      <td className="px-6 py-3">
-                        <input type="text" className="w-full bg-transparent border-b border-transparent focus:border-zinc-200 outline-none italic text-xs text-zinc-500" value={item.note || ''} onChange={e => updateItem(item.id, 'note', e.target.value)} placeholder="..." />
+                      <td className="px-6 py-3 italic text-xs text-zinc-500">
+                        <input 
+                            type="text" 
+                            className="w-full bg-transparent outline-none focus:bg-white focus:ring-1 focus:ring-black rounded px-1"
+                            value={item.note || ''}
+                            placeholder="..."
+                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { note: e.target.value })}
+                        />
                       </td>
-                      <td className="px-6 py-3 text-right flex items-center justify-end gap-3">
-                        {item.file ? (
-                          <div className="relative group/img flex items-center">
-                            <div onClick={() => setPreviewImage(item.file.data)} className="w-10 h-10 rounded-lg overflow-hidden border-2 border-emerald-500 cursor-pointer shadow-sm hover:scale-110 transition-transform bg-zinc-100">
-                              <img src={item.file.data} alt="Превью" className="w-full h-full object-cover" />
-                            </div>
-                            <button onClick={() => updateItem(item.id, 'file', null)} className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-0.5 shadow-lg opacity-0 group-hover/img:opacity-100 transition-opacity scale-75">
-                              <X className="w-3 h-3" />
-                            </button>
-                          </div>
-                        ) : (
-                          <label className="cursor-pointer p-2 rounded-lg text-zinc-300 hover:text-emerald-500 transition-all hover:bg-zinc-100 border border-transparent hover:border-zinc-200">
-                            <Camera className="w-5 h-5" />
-                            <input type="file" className="hidden" accept="image/*" onChange={(e) => handleFileUploadForItem(item.id, e)} />
-                          </label>
-                        )}
-                        <button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id))} className="text-zinc-200 hover:text-red-500 p-2 hover:bg-red-50 rounded-lg transition-colors">
+                      <td className="px-6 py-3 text-right">
+                         <button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id))} className="text-zinc-200 hover:text-red-500 p-2 transition-colors">
                           <Trash2 className="w-4 h-4"/>
                         </button>
                       </td>
@@ -531,23 +518,24 @@ const App = () => {
               </tbody>
             </table>
           </div>
+          
           {items.length > 0 && (
-            <div className="p-8 bg-zinc-900 text-white flex justify-between items-end">
-              <div className="space-y-4">
+            <div className="p-8 bg-zinc-900 text-white flex flex-col md:flex-row justify-between items-end gap-6">
+              <div className="space-y-4 w-full md:w-auto">
                 <div>
                   <p className="text-[9px] text-zinc-500 uppercase font-black tracking-widest">Факт. площадь</p>
                   <p className="text-2xl font-mono">{calculation.area} м²</p>
                 </div>
-                {calculation.complexityExtra > 0 && (
-                  <div>
-                    <p className="text-[9px] text-amber-500 uppercase font-black tracking-widest">Наценка за сложность</p>
-                    <p className="text-2xl font-mono text-amber-400">+{calculation.complexityExtra} ₽</p>
-                  </div>
+                {selectedIds.length > 0 && (
+                    <button onClick={deleteSelected} className="flex items-center gap-2 text-red-400 hover:text-red-300 transition-colors">
+                        <Trash2 className="w-4 h-4" />
+                        <span className="text-[10px] font-black uppercase tracking-widest">Удалить выбранные ({selectedIds.length})</span>
+                    </button>
                 )}
               </div>
-              <div className="text-right">
+              <div className="text-right w-full md:w-auto">
                 <p className="text-[10px] text-zinc-500 uppercase font-black mb-1">Итого (с округл. {calculation.roundedArea} м²)</p>
-                <p className="text-6xl font-black tracking-tighter">{calculation.total.toLocaleString()} ₽</p>
+                <p className="text-6xl font-black tracking-tighter leading-none">{calculation.total.toLocaleString()} ₽</p>
               </div>
             </div>
           )}
@@ -560,77 +548,56 @@ const App = () => {
         )}
       </main>
 
-      {previewImage && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/95 backdrop-blur-md" onClick={() => setPreviewImage(null)}>
-          <button className="absolute top-6 right-6 p-3 bg-white/10 text-white rounded-full hover:bg-white/20">
-            <X className="w-8 h-8" />
-          </button>
-          <div className="max-w-4xl max-h-[85vh] relative" onClick={e => e.stopPropagation()}>
-            <img src={previewImage} alt="Full view" className="max-w-full max-h-full rounded-2xl shadow-2xl animate-in zoom-in-95 duration-200 object-contain" />
-          </div>
-        </div>
-      )}
-
+      {/* SHARE MODAL */}
       {showShareModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm" onClick={() => setShowShareModal(false)}>
-          <div className="bg-white rounded-[3rem] w-full max-w-sm p-10 space-y-8 animate-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
-            <div className="flex justify-between items-center border-b pb-4">
-              <h3 className="font-black uppercase text-xs tracking-widest text-zinc-400">Экспорт заказа</h3>
-              <button onClick={() => setShowShareModal(false)} className="p-2 bg-zinc-100 rounded-full hover:bg-zinc-200 transition-colors"><X className="w-5 h-5"/></button>
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+            <div className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl animate-in fade-in zoom-in duration-200">
+                <div className="flex justify-between items-center mb-8">
+                    <h3 className="font-black uppercase tracking-widest text-sm">Экспорт заказа</h3>
+                    <button onClick={() => setShowShareModal(false)} className="p-2 hover:bg-zinc-100 rounded-full"><X className="w-5 h-5" /></button>
+                </div>
+                <div className="space-y-3">
+                    <button onClick={sendToWhatsApp} className="w-full bg-[#25D366] text-white p-5 rounded-2xl font-black flex items-center justify-center gap-3 uppercase text-[10px] tracking-widest shadow-lg shadow-green-100">
+                        <Phone className="w-4 h-4" /> WhatsApp Менеджеру
+                    </button>
+                    <button onClick={exportToExcel} className="w-full bg-blue-600 text-white p-5 rounded-2xl font-black flex items-center justify-center gap-3 uppercase text-[10px] tracking-widest shadow-lg shadow-blue-100">
+                        <FileSpreadsheet className="w-4 h-4" /> Скачать CSV (Excel)
+                    </button>
+                </div>
             </div>
-            <div className="grid grid-cols-1 gap-4">
-              <button onClick={sendToWhatsApp} className="w-full flex items-center gap-6 p-6 bg-emerald-50 rounded-3xl hover:bg-emerald-100 transition-all border border-emerald-100">
-                <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-emerald-200">
-                  <Phone className="w-6 h-6" />
-                </div>
-                <div className="text-left">
-                  <p className="font-black uppercase text-[10px] text-emerald-600">WhatsApp</p>
-                  <p className="text-xs text-zinc-500">Отправить менеджеру</p>
-                </div>
-              </button>
-              <button onClick={exportToExcel} className="w-full flex items-center gap-6 p-6 bg-zinc-50 rounded-3xl hover:bg-zinc-100 transition-all border border-zinc-100">
-                <div className="w-12 h-12 bg-zinc-900 rounded-2xl flex items-center justify-center text-white">
-                  <FileSpreadsheet className="w-6 h-6" />
-                </div>
-                <div className="text-left">
-                  <p className="font-black uppercase text-[10px] text-zinc-600">Excel / CSV</p>
-                  <p className="text-xs text-zinc-500">Скачать файл</p>
-                </div>
-              </button>
-            </div>
-          </div>
         </div>
       )}
 
+      {/* SETTINGS MODAL */}
       {showSettings && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="bg-white rounded-[3rem] w-full max-w-sm p-10 space-y-6 shadow-2xl">
-            <div className="flex justify-between items-center border-b pb-4">
-              <h3 className="font-black uppercase text-xs tracking-widest">Конфигурация</h3>
-              <button onClick={() => setShowSettings(false)} className="p-2 bg-zinc-100 rounded-full"><X className="w-5 h-5"/></button>
-            </div>
-            <div className="space-y-4">
-              <div>
-                <label className="text-[9px] font-black text-zinc-400 uppercase block mb-1">WhatsApp менеджера</label>
-                <input type="text" className="w-full p-4 bg-zinc-50 border rounded-xl font-mono" value={config.managerPhone} onChange={e => setConfig({...config, managerPhone: e.target.value})} />
-              </div>
-              <div>
-                <label className="text-[9px] font-black text-zinc-400 uppercase block mb-1">Цена за м² (₽)</label>
-                <input type="number" className="w-full p-4 bg-zinc-50 border rounded-xl font-mono" value={config.pricePerM2} onChange={e => setConfig({...config, pricePerM2: Number(e.target.value)})} />
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="text-[9px] font-black text-zinc-400 uppercase block mb-1">Первый размер (₽)</label>
-                  <input type="number" className="w-full p-4 bg-zinc-50 border rounded-xl font-mono text-center" value={config.firstSizeExtra} onChange={e => setConfig({...config, firstSizeExtra: Number(e.target.value)})} />
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+            <div className="bg-white w-full max-w-md rounded-[2.5rem] p-10 shadow-2xl animate-in fade-in zoom-in duration-200">
+                <div className="flex justify-between items-center mb-8">
+                    <h3 className="font-black uppercase tracking-widest text-sm">Настройки конструктора</h3>
+                    <button onClick={() => setShowSettings(false)} className="p-2 hover:bg-zinc-100 rounded-full"><X className="w-5 h-5" /></button>
                 </div>
-                <div>
-                  <label className="text-[9px] font-black text-zinc-400 uppercase block mb-1">Повтор (₽)</label>
-                  <input type="number" className="w-full p-4 bg-zinc-50 border rounded-xl font-mono text-center" value={config.nextSizeExtra} onChange={e => setConfig({...config, nextSizeExtra: Number(e.target.value)})} />
+                <div className="space-y-6">
+                    <div>
+                        <label className="text-[10px] font-black uppercase text-zinc-400 mb-2 block">Телефон менеджера</label>
+                        <input type="text" className="w-full bg-zinc-50 border rounded-2xl px-5 py-4 font-bold" value={config.managerPhone} onChange={e => setConfig({...config, managerPhone: e.target.value})} />
+                    </div>
+                    <div>
+                        <label className="text-[10px] font-black uppercase text-zinc-400 mb-2 block">Цена за 1 м² (₽)</label>
+                        <input type="number" className="w-full bg-zinc-50 border rounded-2xl px-5 py-4 font-bold" value={config.pricePerM2} onChange={e => setConfig({...config, pricePerM2: Number(e.target.value)})} />
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                        <div>
+                            <label className="text-[10px] font-black uppercase text-zinc-400 mb-2 block">1-я фреза (₽)</label>
+                            <input type="number" className="w-full bg-zinc-50 border rounded-2xl px-5 py-4 font-bold" value={config.firstSizeExtra} onChange={e => setConfig({...config, firstSizeExtra: Number(e.target.value)})} />
+                        </div>
+                        <div>
+                            <label className="text-[10px] font-black uppercase text-zinc-400 mb-2 block">След. фреза (₽)</label>
+                            <input type="number" className="w-full bg-zinc-50 border rounded-2xl px-5 py-4 font-bold" value={config.nextSizeExtra} onChange={e => setConfig({...config, nextSizeExtra: Number(e.target.value)})} />
+                        </div>
+                    </div>
+                    <button onClick={() => setShowSettings(false)} className="w-full bg-black text-white p-5 rounded-2xl font-black uppercase text-[10px] tracking-widest mt-4">Закрыть</button>
                 </div>
-              </div>
             </div>
-            <button onClick={() => setShowSettings(false)} className="w-full bg-black text-white py-5 rounded-2xl font-black uppercase text-[10px] tracking-widest">Сохранить</button>
-          </div>
         </div>
       )}
     </div>
