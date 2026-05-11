@@ -25,12 +25,14 @@ import {
   X,
   Camera,
   Phone,
-  CheckCircle2,
   Share2,
   FileSpreadsheet,
   ArrowRightLeft,
   CheckSquare,
-  Square
+  Square,
+  Image as ImageIcon,
+  Upload,
+  Eye
 } from 'lucide-react';
 
 // Инициализация Firebase
@@ -40,9 +42,7 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'facade-constructor-pro';
 
-// ИСПРАВЛЕНИЕ: Безопасный доступ к API ключу.
-// В среде Canvas/Preview API ключ передается через переменную apiKey, которая уже определена или должна быть пустой строкой.
-const apiKey = ""; 
+const apiKey = "const apiKey = process.env.REACT_APP_GEMINI_KEY || "";  
 
 const FACADE_TYPES = [
   { id: 'solid', name: 'Глухой' },
@@ -73,7 +73,7 @@ const App = () => {
   const [selectedIds, setSelectedIds] = useState([]);
   const [inputUnit, setInputUnit] = useState('mm'); 
   const [showShareModal, setShowShareModal] = useState(false);
-  const [previewImage, setPreviewImage] = useState(null);
+  const [viewImage, setViewImage] = useState(null); // Модалка для просмотра фото
   const [isConverted, setIsConverted] = useState(false); 
 
   const [orderMeta, setOrderMeta] = useState({
@@ -88,7 +88,14 @@ const App = () => {
     nextSizeExtra: 100,
   });
 
-  const [formData, setFormData] = useState({ height: '', width: '', count: '1', type: 'solid', note: '' });
+  const [formData, setFormData] = useState({ 
+    height: '', 
+    width: '', 
+    count: '1', 
+    type: 'solid', 
+    note: '',
+    photo: null 
+  });
   const [showSettings, setShowSettings] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
 
@@ -156,21 +163,12 @@ const App = () => {
       } else {
         const integerPart = Math.floor(realArea);
         const decimalPart = realArea - integerPart;
-        
-        if (decimalPart < 0.5) {
-          roundedAreaForPrice = integerPart;
-        } else {
-          roundedAreaForPrice = integerPart + 1;
-        }
+        roundedAreaForPrice = decimalPart < 0.5 ? integerPart : integerPart + 1;
       }
     }
 
-    const complexTypes = [
-      'integrated', 'grille', 'panno', 'multi_panels', 'yoke', 'plinth', 'column', 'custom'
-    ];
-    
+    const complexTypes = ['integrated', 'grille', 'panno', 'multi_panels', 'yoke', 'plinth', 'column', 'custom'];
     const complexItems = items.filter(i => complexTypes.includes(i.type));
-    
     let complexityExtra = 0;
     if (complexItems.length > 0) {
       const uniqueSizes = new Set(complexItems.map(item => `${item.height}x${item.width}`));
@@ -199,6 +197,22 @@ const App = () => {
     setIsConverted(true);
   };
 
+  const handlePhotoUpload = (e, isForm = true, itemId = null) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      const base64 = reader.result;
+      if (isForm) {
+        setFormData(prev => ({ ...prev, photo: base64 }));
+      } else if (itemId && user) {
+        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', itemId), { photo: base64 });
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
   const handleScanImage = async (e) => {
     const file = e.target.files?.[0];
     if (!file || !user) return;
@@ -209,9 +223,8 @@ const App = () => {
     reader.onloadend = async () => {
       const base64Data = reader.result.split(',')[1];
       try {
-        const prompt = `Анализируй фото заказа. Извлеки JSON список деталей: [{"height": число, "width": число, "count": число, "note": "текст"}]. Все изделия должны иметь тип "solid". Соблюдай порядок деталей точно как в списке. Только JSON.`;
+        const prompt = `Анализируй фото заказа. Извлеки JSON список деталей: [{"height": число, "width": число, "count": число}]. Тип всегда "solid". Поле note должно быть пустым. Только JSON.`;
         
-        // Экспоненциальная задержка для API (Exponential backoff)
         const fetchWithRetry = async (url, options, retries = 5, backoff = 1000) => {
           try {
             const res = await fetch(url, options);
@@ -247,9 +260,9 @@ const App = () => {
                 width: item.width, 
                 count: item.count > 0 ? item.count : 1, 
                 type: 'solid', 
-                note: item.note || '', 
-                createdAt: baseTime + i,
-                file: null
+                note: '', // Всегда пусто по требованию пользователя
+                photo: null,
+                createdAt: baseTime + i
               });
             }
           });
@@ -279,20 +292,11 @@ const App = () => {
       count: isNaN(c) || c <= 0 ? 1 : c, 
       type: formData.type, 
       note: formData.note, 
-      file: null, 
+      photo: formData.photo,
       createdAt: Date.now()
     });
-    setFormData({ ...formData, height: '', width: '', count: '1', note: '' });
+    setFormData({ height: '', width: '', count: '1', type: 'solid', note: '', photo: null });
     heightRef.current?.focus();
-  };
-
-  const toggleSelect = (id) => {
-    setSelectedIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
-  };
-
-  const toggleSelectAll = () => {
-    if (selectedIds.length === items.length) setSelectedIds([]);
-    else setSelectedIds(items.map(i => i.id));
   };
 
   const deleteSelected = async () => {
@@ -305,32 +309,12 @@ const App = () => {
     setSelectedIds([]);
   };
 
-  const exportToExcel = () => {
-    const headers = ["№", "Высота (мм)", "Ширина (мм)", "Кол-во (шт)", "Тип", "Примечание"];
-    const rows = sortedItems.map((item, index) => [
-      index + 1,
-      item.height,
-      item.width,
-      item.count,
-      FACADE_TYPES.find(t => t.id === item.type)?.name,
-      (item.note || "").replace(/;/g, ',')
-    ]);
-    const csvContent = "\uFEFF" + [headers, ...rows].map(e => e.join(";")).join("\n");
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `Заказ_${orderMeta.facadeName || 'детали'}.csv`;
-    link.click();
-    setShowShareModal(false);
-  };
-
   const sendToWhatsApp = () => {
     const text = `📐 *ЗАКАЗ ФАСАДОВ*\n` +
       `🏷️ Модель: ${orderMeta.facadeName || 'Не указано'}\n` +
       `📏 Толщина: ${orderMeta.thickness || 'Не указано'} мм\n\n` + 
-      sortedItems.map((item, i) => `${i+1}. ${item.height}x${item.width} мм — ${item.count}шт (${FACADE_TYPES.find(t => t.id === item.type)?.name})${item.note ? ` [${item.note}]` : ''}`).join('\n') +
-      `\n\n--- ИТОГО ---\n📏 Факт. площадь: ${calculation.area} м²\n💰 Сумма (окур.): ${calculation.total} ₽`;
+      sortedItems.map((item, i) => `${i+1}. ${item.height}x${item.width} мм — ${item.count}шт (${FACADE_TYPES.find(t => t.id === item.type)?.name})${item.note ? ` [${item.note}]` : ''}${item.photo ? ' 📸 (+эскиз)' : ''}`).join('\n') +
+      `\n\n--- ИТОГО ---\n📏 Факт. площадь: ${calculation.area} м²\n💰 Сумма: ${calculation.total} ₽`;
     const cleanPhone = config.managerPhone.replace(/\D/g, '');
     window.open(`https://wa.me/${cleanPhone}?text=${encodeURIComponent(text)}`, '_blank');
     setShowShareModal(false);
@@ -340,13 +324,7 @@ const App = () => {
     if (!val) return '';
     let cleaned = val.replace(/,/g, '.');
     if (cleaned.startsWith('.')) cleaned = cleaned.substring(1);
-    if (allowFloat) {
-      const parts = cleaned.split('.');
-      if (parts.length > 2) cleaned = parts[0] + '.' + parts.slice(1).join('');
-      cleaned = cleaned.replace(/[^0-9.]/g, '');
-    } else {
-      cleaned = cleaned.replace(/[^0-9]/g, '');
-    }
+    cleaned = allowFloat ? cleaned.replace(/[^0-9.]/g, '') : cleaned.replace(/[^0-9]/g, '');
     return cleaned;
   };
 
@@ -372,7 +350,7 @@ const App = () => {
       </header>
 
       <main className="max-w-6xl mx-auto p-4 space-y-4">
-        {/* МЕТА ДАННЫЕ */}
+        {/* ВЕРХНЯЯ ПАНЕЛЬ: МЕТА ДАННЫЕ */}
         <section className="bg-white p-6 rounded-3xl border shadow-sm space-y-6">
           <div className="flex flex-col md:flex-row gap-6 items-center">
             <div className="flex bg-zinc-100 p-1.5 rounded-2xl w-full md:w-auto">
@@ -414,16 +392,22 @@ const App = () => {
                 {FACADE_TYPES.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
               </select>
             </div>
-            <button onClick={handleAddItem} className="px-8 py-4 bg-black text-white rounded-xl font-black uppercase text-[10px] h-[52px] hover:bg-zinc-800 transition-all shadow-lg">Добавить</button>
+            <div className="flex gap-2 h-[52px]">
+                <label className={`w-12 flex items-center justify-center border-2 border-dashed rounded-xl cursor-pointer transition-all ${formData.photo ? 'border-emerald-500 bg-emerald-50' : 'hover:border-black'}`}>
+                    {formData.photo ? <img src={formData.photo} className="w-full h-full object-cover rounded-lg" /> : <ImageIcon className="w-5 h-5 text-zinc-300" />}
+                    <input type="file" className="hidden" accept="image/*" onChange={(e) => handlePhotoUpload(e)} />
+                </label>
+                <button onClick={handleAddItem} className="px-8 bg-black text-white rounded-xl font-black uppercase text-[10px] hover:bg-zinc-800 transition-all shadow-lg">Добавить</button>
+            </div>
           </div>
           <div className="flex flex-wrap items-center justify-between gap-4 pt-2">
-            <input type="text" placeholder="Примечание к детали..." className="flex-1 bg-zinc-50 border rounded-xl px-4 py-3 text-xs italic outline-none focus:ring-1 focus:ring-black" value={formData.note} onChange={e => setFormData({...formData, note: e.target.value})} />
+            <input type="text" placeholder="Примечание..." className="flex-1 bg-zinc-50 border rounded-xl px-4 py-3 text-xs italic outline-none focus:ring-1 focus:ring-black" value={formData.note} onChange={e => setFormData({...formData, note: e.target.value})} />
             
             <div className="flex gap-2">
               {items.length > 0 && !isConverted && (
                 <button onClick={convertCmToMm} className="flex items-center gap-2 px-6 py-3 rounded-xl border-2 border-amber-200 bg-amber-50 hover:bg-amber-100 text-amber-700 transition-all shadow-sm">
                   <ArrowRightLeft className="w-4 h-4" />
-                  <span className="text-[10px] font-black uppercase">Конвертировать СМ → ММ</span>
+                  <span className="text-[10px] font-black uppercase">СМ → ММ</span>
                 </button>
               )}
               <label className={`flex items-center gap-2 px-6 py-3 rounded-xl border-2 border-dashed cursor-pointer transition-all ${isScanning ? 'bg-zinc-100 opacity-50' : 'bg-white hover:border-black'}`}>
@@ -435,77 +419,73 @@ const App = () => {
           </div>
         </section>
 
-        {/* ТАБЛИЦА */}
+        {/* ТАБЛИЦА СПИСКА */}
         <section className="bg-white rounded-[2rem] border shadow-sm overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full border-collapse">
               <thead className="bg-zinc-50 text-[9px] font-black uppercase text-zinc-400 border-b">
                 <tr>
                   <th className="px-4 py-4 text-left w-10">
-                    <button onClick={toggleSelectAll} className="p-1 hover:bg-zinc-200 rounded transition-colors">
+                    <button onClick={() => {
+                        if (selectedIds.length === items.length) setSelectedIds([]);
+                        else setSelectedIds(items.map(i => i.id));
+                    }} className="p-1 hover:bg-zinc-200 rounded transition-colors">
                       {selectedIds.length === items.length && items.length > 0 ? <CheckSquare className="w-5 h-5 text-black" /> : <Square className="w-5 h-5" />}
                     </button>
                   </th>
                   <th className="px-4 py-4 text-center">Выс (мм)</th>
                   <th className="px-4 py-4 text-center">Шир (мм)</th>
                   <th className="px-4 py-4 text-center">Шт</th>
-                  <th className="px-6 py-4 text-left">Тип фасада</th>
+                  <th className="px-6 py-4 text-left">Тип</th>
                   <th className="px-6 py-4 text-left">Примечание</th>
-                  <th className="px-6 py-4 text-right">Действия</th>
+                  <th className="px-6 py-4 text-center">Эскиз/Фото</th>
+                  <th className="px-6 py-4 text-right">Действие</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-50">
                 {items.length === 0 ? (
-                  <tr><td colSpan="7" className="py-20 text-center text-zinc-200 font-black uppercase tracking-widest">Список пуст</td></tr>
+                  <tr><td colSpan="8" className="py-20 text-center text-zinc-200 font-black uppercase tracking-widest">Список пуст</td></tr>
                 ) : (
                   sortedItems.map(item => (
                     <tr key={item.id} className={`hover:bg-zinc-50/50 group transition-colors ${selectedIds.includes(item.id) ? 'bg-zinc-100/50' : ''}`}>
                       <td className="px-4 py-3">
-                        <button onClick={() => toggleSelect(item.id)} className="p-1">
+                        <button onClick={() => setSelectedIds(prev => prev.includes(item.id) ? prev.filter(i => i !== item.id) : [...prev, item.id])} className="p-1">
                           {selectedIds.includes(item.id) ? <CheckSquare className="w-5 h-5 text-black" /> : <Square className="w-5 h-5 text-zinc-300 group-hover:text-zinc-400" />}
                         </button>
                       </td>
                       <td className="px-4 py-3 text-center font-mono font-bold">
-                        <input 
-                            type="text" 
-                            className="w-16 bg-transparent text-center outline-none focus:bg-white focus:ring-1 focus:ring-black rounded"
-                            value={item.height}
-                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { height: cleanNumericInput(e.target.value, false) })}
-                        />
+                        <input type="text" className="w-16 bg-transparent text-center outline-none focus:bg-white focus:ring-1 focus:ring-black rounded" value={item.height} onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { height: cleanNumericInput(e.target.value, false) })} />
                       </td>
                       <td className="px-4 py-3 text-center font-mono font-bold">
-                        <input 
-                            type="text" 
-                            className="w-16 bg-transparent text-center outline-none focus:bg-white focus:ring-1 focus:ring-black rounded"
-                            value={item.width}
-                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { width: cleanNumericInput(e.target.value, false) })}
-                        />
+                        <input type="text" className="w-16 bg-transparent text-center outline-none focus:bg-white focus:ring-1 focus:ring-black rounded" value={item.width} onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { width: cleanNumericInput(e.target.value, false) })} />
                       </td>
-                      <td className="px-4 py-3 text-center">
-                        <input 
-                            type="text" 
-                            className="w-10 bg-transparent text-center outline-none focus:bg-white focus:ring-1 focus:ring-black rounded"
-                            value={item.count}
-                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { count: cleanNumericInput(e.target.value, false) })}
-                        />
+                      <td className="px-4 py-3 text-center font-bold">
+                        <input type="text" className="w-10 bg-transparent text-center outline-none focus:bg-white focus:ring-1 focus:ring-black rounded" value={item.count} onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { count: cleanNumericInput(e.target.value, false) })} />
                       </td>
                       <td className="px-6 py-3">
-                         <select 
-                            className="text-[10px] font-black uppercase px-2 py-1 bg-zinc-100 rounded-md outline-none"
-                            value={item.type}
-                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { type: e.target.value })}
-                         >
+                         <select className="text-[10px] font-black uppercase px-2 py-1 bg-zinc-100 rounded-md outline-none" value={item.type} onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { type: e.target.value })}>
                             {FACADE_TYPES.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
                          </select>
                       </td>
-                      <td className="px-6 py-3 italic text-xs text-zinc-500">
-                        <input 
-                            type="text" 
-                            className="w-full bg-transparent outline-none focus:bg-white focus:ring-1 focus:ring-black rounded px-1"
-                            value={item.note || ''}
-                            placeholder="..."
-                            onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { note: e.target.value })}
-                        />
+                      <td className="px-6 py-3 italic text-xs">
+                         <input type="text" className="w-full bg-transparent outline-none focus:bg-white focus:ring-1 focus:ring-black rounded px-2 py-1" value={item.note || ''} placeholder="..." onChange={(e) => updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id), { note: e.target.value })} />
+                      </td>
+                      <td className="px-6 py-3 text-center">
+                        <div className="flex justify-center">
+                            <label className={`w-10 h-10 flex items-center justify-center border rounded-xl cursor-pointer hover:bg-zinc-100 transition-all overflow-hidden ${item.photo ? 'border-emerald-200' : 'border-dashed border-zinc-200'}`}>
+                                {item.photo ? (
+                                    <div className="relative w-full h-full group/img" onClick={(e) => { e.preventDefault(); setViewImage(item.photo); }}>
+                                        <img src={item.photo} className="w-full h-full object-cover" />
+                                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover/img:opacity-100 flex items-center justify-center transition-all">
+                                            <Eye className="w-4 h-4 text-white" />
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <Upload className="w-4 h-4 text-zinc-300" />
+                                )}
+                                <input type="file" className="hidden" accept="image/*" onChange={(e) => handlePhotoUpload(e, false, item.id)} />
+                            </label>
+                        </div>
                       </td>
                       <td className="px-6 py-3 text-right">
                          <button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'currentOrder', item.id))} className="text-zinc-200 hover:text-red-500 p-2 transition-colors">
@@ -534,7 +514,7 @@ const App = () => {
                 )}
               </div>
               <div className="text-right w-full md:w-auto">
-                <p className="text-[10px] text-zinc-500 uppercase font-black mb-1">Итого (с округл. {calculation.roundedArea} м²)</p>
+                <p className="text-[10px] text-zinc-500 uppercase font-black mb-1">Итого (округл. {calculation.roundedArea} м²)</p>
                 <p className="text-6xl font-black tracking-tighter leading-none">{calculation.total.toLocaleString()} ₽</p>
               </div>
             </div>
@@ -548,32 +528,54 @@ const App = () => {
         )}
       </main>
 
-      {/* SHARE MODAL */}
+      {/* МОДАЛЬНОЕ ОКНО ПРОСМОТРА ФОТО */}
+      {viewImage && (
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-md z-[110] flex items-center justify-center p-4" onClick={() => setViewImage(null)}>
+            <div className="relative max-w-4xl max-h-[90vh] flex items-center justify-center">
+                <button className="absolute -top-12 right-0 text-white p-2 hover:bg-white/10 rounded-full transition-all">
+                    <X className="w-8 h-8" />
+                </button>
+                <img src={viewImage} className="max-w-full max-h-full object-contain rounded-2xl shadow-2xl" onClick={e => e.stopPropagation()} />
+            </div>
+        </div>
+      )}
+
+      {/* МОДАЛЬНОЕ ОКНО ОТПРАВКИ */}
       {showShareModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
-            <div className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl animate-in fade-in zoom-in duration-200">
+            <div className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl">
                 <div className="flex justify-between items-center mb-8">
-                    <h3 className="font-black uppercase tracking-widest text-sm">Экспорт заказа</h3>
+                    <h3 className="font-black uppercase tracking-widest text-sm text-zinc-400">Экспорт заказа</h3>
                     <button onClick={() => setShowShareModal(false)} className="p-2 hover:bg-zinc-100 rounded-full"><X className="w-5 h-5" /></button>
                 </div>
                 <div className="space-y-3">
                     <button onClick={sendToWhatsApp} className="w-full bg-[#25D366] text-white p-5 rounded-2xl font-black flex items-center justify-center gap-3 uppercase text-[10px] tracking-widest shadow-lg shadow-green-100">
                         <Phone className="w-4 h-4" /> WhatsApp Менеджеру
                     </button>
-                    <button onClick={exportToExcel} className="w-full bg-blue-600 text-white p-5 rounded-2xl font-black flex items-center justify-center gap-3 uppercase text-[10px] tracking-widest shadow-lg shadow-blue-100">
-                        <FileSpreadsheet className="w-4 h-4" /> Скачать CSV (Excel)
+                    <button onClick={() => {
+                        const headers = ["№", "Выс", "Шир", "Шт", "Тип", "Примеч"];
+                        const rows = sortedItems.map((it, i) => [i+1, it.height, it.width, it.count, it.type, it.note]);
+                        const csv = "\uFEFF" + [headers, ...rows].map(e => e.join(";")).join("\n");
+                        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                        const link = document.createElement("a");
+                        link.href = URL.createObjectURL(blob);
+                        link.download = "заказ.csv";
+                        link.click();
+                        setShowShareModal(false);
+                    }} className="w-full bg-blue-600 text-white p-5 rounded-2xl font-black flex items-center justify-center gap-3 uppercase text-[10px] tracking-widest shadow-lg shadow-blue-100">
+                        <FileSpreadsheet className="w-4 h-4" /> Скачать в Excel (CSV)
                     </button>
                 </div>
             </div>
         </div>
       )}
 
-      {/* SETTINGS MODAL */}
+      {/* НАСТРОЙКИ */}
       {showSettings && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
-            <div className="bg-white w-full max-w-md rounded-[2.5rem] p-10 shadow-2xl animate-in fade-in zoom-in duration-200">
+            <div className="bg-white w-full max-w-md rounded-[2.5rem] p-10 shadow-2xl">
                 <div className="flex justify-between items-center mb-8">
-                    <h3 className="font-black uppercase tracking-widest text-sm">Настройки конструктора</h3>
+                    <h3 className="font-black uppercase tracking-widest text-sm text-zinc-400">Цены и Контакты</h3>
                     <button onClick={() => setShowSettings(false)} className="p-2 hover:bg-zinc-100 rounded-full"><X className="w-5 h-5" /></button>
                 </div>
                 <div className="space-y-6">
@@ -582,7 +584,7 @@ const App = () => {
                         <input type="text" className="w-full bg-zinc-50 border rounded-2xl px-5 py-4 font-bold" value={config.managerPhone} onChange={e => setConfig({...config, managerPhone: e.target.value})} />
                     </div>
                     <div>
-                        <label className="text-[10px] font-black uppercase text-zinc-400 mb-2 block">Цена за 1 м² (₽)</label>
+                        <label className="text-[10px] font-black uppercase text-zinc-400 mb-2 block tracking-widest">Цена за 1 м² (₽)</label>
                         <input type="number" className="w-full bg-zinc-50 border rounded-2xl px-5 py-4 font-bold" value={config.pricePerM2} onChange={e => setConfig({...config, pricePerM2: Number(e.target.value)})} />
                     </div>
                     <div className="grid grid-cols-2 gap-4">
@@ -595,7 +597,7 @@ const App = () => {
                             <input type="number" className="w-full bg-zinc-50 border rounded-2xl px-5 py-4 font-bold" value={config.nextSizeExtra} onChange={e => setConfig({...config, nextSizeExtra: Number(e.target.value)})} />
                         </div>
                     </div>
-                    <button onClick={() => setShowSettings(false)} className="w-full bg-black text-white p-5 rounded-2xl font-black uppercase text-[10px] tracking-widest mt-4">Закрыть</button>
+                    <button onClick={() => setShowSettings(false)} className="w-full bg-black text-white p-5 rounded-2xl font-black uppercase text-[10px] tracking-widest mt-4">Сохранить</button>
                 </div>
             </div>
         </div>
